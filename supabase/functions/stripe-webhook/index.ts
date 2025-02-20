@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.7';
 import Stripe from 'https://esm.sh/stripe@14.18.0?target=deno';
@@ -13,178 +14,170 @@ const TOKEN_CONTRACT_ADDRESS = Deno.env.get('TOKEN_CONTRACT_ADDRESS');
 const ADMIN_PRIVATE_KEY = Deno.env.get('ADMIN_PRIVATE_KEY');
 const RPC_URL = Deno.env.get('RPC_URL');
 
-// Validate required environment variables
-if (!endpointSecret) {
-  console.error('Missing STRIPE_WEBHOOK_SECRET');
-}
-if (!TOKEN_CONTRACT_ADDRESS) {
-  console.error('Missing TOKEN_CONTRACT_ADDRESS');
-}
-if (!ADMIN_PRIVATE_KEY) {
-  console.error('Missing ADMIN_PRIVATE_KEY');
-}
-if (!RPC_URL) {
-  console.error('Missing RPC_URL');
-}
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, stripe-signature',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
 
-const tokenABI = [
-  "function balanceOf(address account) view returns (uint256)",
-  "function decimals() view returns (uint8)",
-  "function owner() view returns (address)",
-  "function mint(address to, uint256 amount)",
-  "function transfer(address to, uint256 value) returns (bool)"
-];
-
-async function transferTokens(recipientAddress: string, amount: number): Promise<string> {
-  console.log('Starting token transfer:', { recipientAddress, amount });
-  
+async function transferTokens(walletAddress: string, amount: string, supabaseClient: any, transactionId: string) {
   try {
-    if (!RPC_URL || !TOKEN_CONTRACT_ADDRESS || !ADMIN_PRIVATE_KEY) {
-      throw new Error('Missing required environment variables for token transfer');
+    // Validate wallet address
+    if (!ethers.isAddress(walletAddress)) {
+      throw new Error('Invalid wallet address');
     }
 
-    console.log('Connecting to provider:', RPC_URL);
+    // Connect to provider and create wallet
     const provider = new ethers.JsonRpcProvider(RPC_URL);
     
-    console.log('Creating wallet instance');
-    const wallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
-    console.log('Wallet address:', wallet.address);
+    // Check provider connection
+    await provider.getNetwork();
     
-    console.log('Creating contract instance:', TOKEN_CONTRACT_ADDRESS);
+    const wallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+    
+    // Minimal ABI for token interactions
+    const tokenABI = [
+      "function transfer(address to, uint256 amount) returns (bool)",
+      "function decimals() view returns (uint8)",
+      "function balanceOf(address account) view returns (uint256)"
+    ];
+    
     const tokenContract = new ethers.Contract(TOKEN_CONTRACT_ADDRESS, tokenABI, wallet);
     
-    console.log('Getting token decimals');
-    const decimals = await tokenContract.decimals();
-    console.log('Token decimals:', decimals);
+    // Get token decimals and admin balance
+    const [decimals, adminBalance] = await Promise.all([
+      tokenContract.decimals(),
+      tokenContract.balanceOf(wallet.address)
+    ]);
     
-    console.log('Calculating token amount with decimals:', decimals);
+    // Calculate token amount with decimals
     const tokenAmount = ethers.parseUnits(amount.toString(), decimals);
-    console.log('Token amount in wei:', tokenAmount.toString());
     
-    // Check if we should use mint or transfer
-    console.log('Checking contract ownership');
-    const ownerAddress = await tokenContract.owner();
-    console.log('Contract owner:', ownerAddress);
-    console.log('Wallet address:', wallet.address);
-    const usesMint = ownerAddress.toLowerCase() === wallet.address.toLowerCase();
-    
-    console.log('Transaction type:', usesMint ? 'mint' : 'transfer');
-
-    let tx;
-    if (usesMint) {
-      console.log('Minting new tokens');
-      tx = await tokenContract.mint(recipientAddress, tokenAmount);
-    } else {
-      console.log('Transferring existing tokens');
-      const balance = await tokenContract.balanceOf(wallet.address);
-      console.log('Current balance:', balance.toString());
-      if (balance < tokenAmount) {
-        throw new Error('Insufficient balance for transfer');
-      }
-      tx = await tokenContract.transfer(recipientAddress, tokenAmount);
+    // Check if admin has enough balance
+    if (adminBalance < tokenAmount) {
+      throw new Error('Insufficient admin token balance');
     }
     
-    console.log('Transaction sent:', tx.hash);
-    console.log('Waiting for confirmation...');
-    const receipt = await tx.wait();
+    // Update transaction status to processing
+    await supabaseClient
+      .from('transactions')
+      .update({ status: 'processing' })
+      .eq('id', transactionId);
     
-    console.log('Transfer successful:', receipt.hash);
+    // Send transfer transaction
+    const tx = await tokenContract.transfer(walletAddress, tokenAmount, {
+      gasLimit: 100000 // Set reasonable gas limit
+    });
+    
+    console.log('Transfer transaction sent:', tx.hash);
+    
+    // Wait for transaction confirmation
+    const receipt = await tx.wait();
+    console.log('Transfer confirmed in block:', receipt.blockNumber);
+    
     return receipt.hash;
   } catch (error) {
-    console.error('Token transfer failed:', error);
+    console.error('Token transfer error:', error);
     throw error;
   }
 }
 
 serve(async (req) => {
-  console.log('Received webhook request');
-  const signature = req.headers.get('stripe-signature');
-
-  if (!signature) {
-    console.error('Missing stripe-signature header');
-    return new Response('No signature', { status: 400 });
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
   }
 
-  if (!endpointSecret) {
-    console.error('Missing STRIPE_WEBHOOK_SECRET environment variable');
-    return new Response('Configuration error', { status: 500 });
+  const signature = req.headers.get('stripe-signature');
+  
+  if (!signature || !endpointSecret) {
+    return new Response(
+      JSON.stringify({ error: !signature ? 'No signature provided' : 'Webhook secret not configured' }), 
+      { 
+        status: !signature ? 400 : 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      }
+    );
   }
 
   try {
     const body = await req.text();
-    console.log('Constructing Stripe event');
-    console.log('Signature:', signature);
-    console.log('Endpoint secret length:', endpointSecret.length);
+    let event;
     
-    const event = stripe.webhooks.constructEvent(
-      body,
-      signature,
-      endpointSecret
-    );
-
-    console.log('Event processed successfully:', event.type);
-
-    const supabaseClient = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    );
+    try {
+      event = await stripe.webhooks.constructEventAsync(body, signature, endpointSecret);
+    } catch (err) {
+      console.error('Webhook signature verification failed:', err.message);
+      return new Response(
+        JSON.stringify({ error: 'Webhook signature verification failed' }), 
+        { 
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        }
+      );
+    }
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
       const { transactionId, walletAddress, tokenAmount } = session.metadata;
 
-      console.log('Processing completed checkout:', {
-        transactionId,
-        walletAddress,
-        tokenAmount
-      });
+      const supabaseClient = createClient(
+        Deno.env.get('SUPABASE_URL') ?? '',
+        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+      );
 
       try {
-        console.log('Initiating token transfer');
-        const txHash = await transferTokens(walletAddress, Number(tokenAmount));
+        // Perform token transfer
+        const txHash = await transferTokens(
+          walletAddress,
+          tokenAmount,
+          supabaseClient,
+          transactionId
+        );
 
-        console.log('Updating transaction status');
-        const { error: updateError } = await supabaseClient
+        // Update transaction with success
+        await supabaseClient
           .from('transactions')
           .update({ 
             status: 'completed',
-            blockchain_tx_hash: txHash
+            blockchain_tx_hash: txHash,
+            completed_at: new Date().toISOString()
           })
           .eq('id', transactionId);
 
-        if (updateError) {
-          console.error('Failed to update transaction:', updateError);
-          throw updateError;
-        }
+        console.log('Transaction completed successfully:', txHash);
 
-        console.log('Transaction updated successfully');
-      } catch (transferError) {
-        console.error('Token transfer failed:', transferError);
+      } catch (error) {
+        console.error('Token transfer failed:', error);
         
-        const { error: updateError } = await supabaseClient
+        // Update transaction with error
+        await supabaseClient
           .from('transactions')
           .update({ 
             status: 'failed',
-            error_message: transferError.message
+            error_message: error.message,
+            updated_at: new Date().toISOString()
           })
           .eq('id', transactionId);
 
-        if (updateError) {
-          console.error('Failed to update transaction status:', updateError);
-        }
-          
-        throw transferError;
+        // We don't throw here to still return 200 to Stripe
+        // The error is logged and stored in the database
       }
     }
 
-    return new Response(JSON.stringify({ received: true }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ received: true }), 
+      { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      }
+    );
   } catch (err) {
     console.error('Webhook error:', err);
     return new Response(
-      JSON.stringify({ error: err.message }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
+      JSON.stringify({ error: err.message }), 
+      { 
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      }
     );
   }
 });
