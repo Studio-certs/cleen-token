@@ -8,68 +8,84 @@ const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') ?? '', {
   httpClient: Stripe.createFetchHttpClient(),
 });
 
-const endpointSecret = Deno.env.get('STRIPE_WEBHOOK_SECRET') ?? '';
+const endpointSecret = Deno.env.get('STRIPE_WEBHOOK_SECRET');
+const TOKEN_CONTRACT_ADDRESS = Deno.env.get('TOKEN_CONTRACT_ADDRESS');
+const ADMIN_PRIVATE_KEY = Deno.env.get('ADMIN_PRIVATE_KEY');
+const RPC_URL = Deno.env.get('RPC_URL');
 
-// Token contract configuration
-const TOKEN_CONTRACT_ADDRESS = Deno.env.get('TOKEN_CONTRACT_ADDRESS') ?? '';
-const ADMIN_PRIVATE_KEY = Deno.env.get('ADMIN_PRIVATE_KEY') ?? '';
-const RPC_URL = Deno.env.get('RPC_URL') ?? '';
+// Validate required environment variables
+if (!endpointSecret) {
+  console.error('Missing STRIPE_WEBHOOK_SECRET');
+}
+if (!TOKEN_CONTRACT_ADDRESS) {
+  console.error('Missing TOKEN_CONTRACT_ADDRESS');
+}
+if (!ADMIN_PRIVATE_KEY) {
+  console.error('Missing ADMIN_PRIVATE_KEY');
+}
+if (!RPC_URL) {
+  console.error('Missing RPC_URL');
+}
 
-// Full ERC20 ABI with mint function
 const tokenABI = [
-  // Read-only functions
   "function balanceOf(address account) view returns (uint256)",
   "function decimals() view returns (uint8)",
-  "function name() view returns (string)",
-  "function symbol() view returns (string)",
-  "function totalSupply() view returns (uint256)",
-  "function allowance(address owner, address spender) view returns (uint256)",
-  
-  // State-changing functions
-  "function transfer(address to, uint256 value) returns (bool)",
-  "function approve(address spender, uint256 value) returns (bool)",
-  "function transferFrom(address from, address to, uint256 value) returns (bool)",
+  "function owner() view returns (address)",
   "function mint(address to, uint256 amount)",
-  
-  // Events
-  "event Transfer(address indexed from, address indexed to, uint256 value)",
-  "event Approval(address indexed owner, address indexed spender, uint256 value)"
+  "function transfer(address to, uint256 value) returns (bool)"
 ];
 
 async function transferTokens(recipientAddress: string, amount: number): Promise<string> {
   console.log('Starting token transfer:', { recipientAddress, amount });
   
   try {
+    if (!RPC_URL || !TOKEN_CONTRACT_ADDRESS || !ADMIN_PRIVATE_KEY) {
+      throw new Error('Missing required environment variables for token transfer');
+    }
+
     console.log('Connecting to provider:', RPC_URL);
     const provider = new ethers.JsonRpcProvider(RPC_URL);
     
     console.log('Creating wallet instance');
     const wallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+    console.log('Wallet address:', wallet.address);
     
     console.log('Creating contract instance:', TOKEN_CONTRACT_ADDRESS);
     const tokenContract = new ethers.Contract(TOKEN_CONTRACT_ADDRESS, tokenABI, wallet);
     
     console.log('Getting token decimals');
     const decimals = await tokenContract.decimals();
+    console.log('Token decimals:', decimals);
     
     console.log('Calculating token amount with decimals:', decimals);
     const tokenAmount = ethers.parseUnits(amount.toString(), decimals);
+    console.log('Token amount in wei:', tokenAmount.toString());
     
     // Check if we should use mint or transfer
+    console.log('Checking contract ownership');
     const ownerAddress = await tokenContract.owner();
+    console.log('Contract owner:', ownerAddress);
+    console.log('Wallet address:', wallet.address);
     const usesMint = ownerAddress.toLowerCase() === wallet.address.toLowerCase();
     
     console.log('Transaction type:', usesMint ? 'mint' : 'transfer');
+
     let tx;
     if (usesMint) {
-      // If we're the owner, mint new tokens
+      console.log('Minting new tokens');
       tx = await tokenContract.mint(recipientAddress, tokenAmount);
     } else {
-      // Otherwise transfer existing tokens
+      console.log('Transferring existing tokens');
+      const balance = await tokenContract.balanceOf(wallet.address);
+      console.log('Current balance:', balance.toString());
+      if (balance < tokenAmount) {
+        throw new Error('Insufficient balance for transfer');
+      }
       tx = await tokenContract.transfer(recipientAddress, tokenAmount);
     }
     
-    console.log('Waiting for transaction confirmation');
+    console.log('Transaction sent:', tx.hash);
+    console.log('Waiting for confirmation...');
     const receipt = await tx.wait();
     
     console.log('Transfer successful:', receipt.hash);
@@ -81,25 +97,32 @@ async function transferTokens(recipientAddress: string, amount: number): Promise
 }
 
 serve(async (req) => {
+  console.log('Received webhook request');
   const signature = req.headers.get('stripe-signature');
 
   if (!signature) {
-    console.log('Missing Stripe signature');
+    console.error('Missing stripe-signature header');
     return new Response('No signature', { status: 400 });
   }
 
+  if (!endpointSecret) {
+    console.error('Missing STRIPE_WEBHOOK_SECRET environment variable');
+    return new Response('Configuration error', { status: 500 });
+  }
+
   try {
-    console.log('Processing webhook request');
     const body = await req.text();
-    
     console.log('Constructing Stripe event');
+    console.log('Signature:', signature);
+    console.log('Endpoint secret length:', endpointSecret.length);
+    
     const event = stripe.webhooks.constructEvent(
       body,
       signature,
       endpointSecret
     );
 
-    console.log('Event type:', event.type);
+    console.log('Event processed successfully:', event.type);
 
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
@@ -117,13 +140,11 @@ serve(async (req) => {
       });
 
       try {
-        // Transfer tokens
         console.log('Initiating token transfer');
         const txHash = await transferTokens(walletAddress, Number(tokenAmount));
 
         console.log('Updating transaction status');
-        // Update transaction status and add transaction hash
-        await supabaseClient
+        const { error: updateError } = await supabaseClient
           .from('transactions')
           .update({ 
             status: 'completed',
@@ -131,20 +152,26 @@ serve(async (req) => {
           })
           .eq('id', transactionId);
 
-        console.log('Transaction updated successfully');
+        if (updateError) {
+          console.error('Failed to update transaction:', updateError);
+          throw updateError;
+        }
 
+        console.log('Transaction updated successfully');
       } catch (transferError) {
         console.error('Token transfer failed:', transferError);
         
-        console.log('Updating transaction with error status');
-        // Update transaction with error status
-        await supabaseClient
+        const { error: updateError } = await supabaseClient
           .from('transactions')
           .update({ 
             status: 'failed',
             error_message: transferError.message
           })
           .eq('id', transactionId);
+
+        if (updateError) {
+          console.error('Failed to update transaction status:', updateError);
+        }
           
         throw transferError;
       }
