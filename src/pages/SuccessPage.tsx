@@ -81,9 +81,8 @@ function SuccessPage() {
   };
 
   const getEtherscanUrl = () => {
-    // Replace with appropriate network URL (mainnet, testnet, etc.)
-    const baseUrl = 'https://etherscan.io/tx/';
-    return `${baseUrl}${transaction?.blockchain_tx_hash}`;
+    if (!transaction?.blockchain_tx_hash) return '';
+    return `https://sepolia.etherscan.io/tx/${transaction.blockchain_tx_hash}`;
   };
 
   return (
