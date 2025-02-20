@@ -1,12 +1,23 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Feather as Ethereum, CheckCircle, ArrowLeft } from 'lucide-react';
+import { Feather as Ethereum, CheckCircle, ArrowLeft, ExternalLink } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+
+interface Transaction {
+  id: string;
+  wallet_address: string;
+  token_amount: number;
+  amount_usd: number;
+  status: string;
+  blockchain_tx_hash?: string;
+  error_message?: string;
+}
 
 function SuccessPage() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const [transaction, setTransaction] = useState<any>(null);
+  const [transaction, setTransaction] = useState<Transaction | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   const sessionId = searchParams.get('session_id');
 
   useEffect(() => {
@@ -22,10 +33,58 @@ function SuccessPage() {
       if (!error && data) {
         setTransaction(data);
       }
+      setIsLoading(false);
+    };
+
+    const pollTransaction = async () => {
+      const interval = setInterval(async () => {
+        const { data, error } = await supabase
+          .from('transactions')
+          .select('*')
+          .eq('stripe_session_id', sessionId)
+          .single();
+
+        if (!error && data && (data.blockchain_tx_hash || data.error_message)) {
+          setTransaction(data);
+          clearInterval(interval);
+          setIsLoading(false);
+        }
+      }, 3000); // Poll every 3 seconds
+
+      // Cleanup interval
+      return () => clearInterval(interval);
     };
 
     fetchTransaction();
+    pollTransaction();
   }, [sessionId]);
+
+  const getStatusDisplay = () => {
+    if (isLoading) {
+      return (
+        <div className="flex items-center justify-center space-x-2">
+          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-emerald-400"></div>
+          <span className="text-emerald-400">Processing Transfer...</span>
+        </div>
+      );
+    }
+
+    if (transaction?.error_message) {
+      return <span className="text-red-400">Failed: {transaction.error_message}</span>;
+    }
+
+    if (transaction?.blockchain_tx_hash) {
+      return <span className="text-emerald-400">Completed</span>;
+    }
+
+    return <span className="text-yellow-400">Pending</span>;
+  };
+
+  const getEtherscanUrl = () => {
+    // Replace with appropriate network URL (mainnet, testnet, etc.)
+    const baseUrl = 'https://etherscan.io/tx/';
+    return `${baseUrl}${transaction?.blockchain_tx_hash}`;
+  };
 
   return (
     <div className="min-h-screen relative">
@@ -88,10 +147,28 @@ function SuccessPage() {
                           {transaction.wallet_address.slice(0, 6)}...{transaction.wallet_address.slice(-4)}
                         </dd>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex justify-between items-center">
                         <dt className="text-gray-400">Status</dt>
-                        <dd className="text-emerald-400 font-medium">Completed</dd>
+                        <dd>{getStatusDisplay()}</dd>
                       </div>
+                      {transaction.blockchain_tx_hash && (
+                        <div className="flex justify-between items-center">
+                          <dt className="text-gray-400">Transaction</dt>
+                          <dd>
+                            <a
+                              href={getEtherscanUrl()}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-emerald-400 hover:text-emerald-300 flex items-center space-x-1"
+                            >
+                              <span className="font-mono text-sm">
+                                {transaction.blockchain_tx_hash.slice(0, 6)}...{transaction.blockchain_tx_hash.slice(-4)}
+                              </span>
+                              <ExternalLink className="w-4 h-4" />
+                            </a>
+                          </dd>
+                        </div>
+                      )}
                     </dl>
                   </div>
                 </div>
